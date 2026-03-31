@@ -1,0 +1,439 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { 
+  getFirestore, 
+  collection, 
+  addDoc, 
+  onSnapshot, 
+  deleteDoc, 
+  doc, 
+  getDocs 
+} from 'firebase/firestore';
+
+// Konfigurasi Firebase
+const firebaseConfig = JSON.parse(__firebase_config);
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'tirta-waluya-v1';
+
+export default function App() {
+  const [user, setUser] = useState(null);
+  const [view, setView] = useState('staff'); 
+  const [isAdminAuthenticated, setIsAdminAuthenticated] = useState(false);
+  const [pinInput, setPinInput] = useState('');
+  const [attendanceList, setAttendanceList] = useState([]);
+  const [loading, setLoading] = useState(false);
+  
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const [isCameraActive, setIsCameraActive] = useState(false);
+  const [locationStatus, setLocationStatus] = useState('idle'); 
+  const [currentTime, setCurrentTime] = useState(new Date());
+  
+  const [formData, setFormData] = useState({
+    name: '',
+    gen: '60',
+    status: 'Hadir',
+    photo: null,
+    location: null 
+  });
+
+  // URL Logo baru dari upload
+  const LOGO_URL = "image_4988e9.png";
+
+  useEffect(() => {
+    const timer = setInterval(() => setCurrentTime(new Date()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+          await signInWithCustomToken(auth, __initial_auth_token);
+        } else {
+          await signInAnonymously(auth);
+        }
+      } catch (err) {
+        console.error("Auth error", err);
+      }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    const q = collection(db, 'artifacts', appId, 'public', 'data', 'presensi');
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const docs = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+      const sorted = docs.sort((a, b) => b.timestamp - a.timestamp);
+      setAttendanceList(sorted);
+    }, (err) => console.error("Firestore error", err));
+    return () => unsubscribe();
+  }, [user]);
+
+  const requestLocation = () => {
+    setLocationStatus('searching');
+    if (!navigator.geolocation) {
+      setLocationStatus('error');
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        setFormData(prev => ({
+          ...prev,
+          location: { lat: position.coords.latitude, lng: position.coords.longitude }
+        }));
+        setLocationStatus('found');
+      },
+      () => setLocationStatus('error'),
+      { enableHighAccuracy: true }
+    );
+  };
+
+  const startCamera = async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ 
+        video: { facingMode: "user" }, 
+        audio: false 
+      });
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        setIsCameraActive(true);
+        requestLocation();
+      }
+    } catch (err) {
+      alert("Izin kamera diperlukan untuk presensi.");
+    }
+  };
+
+  const stopCamera = () => {
+    if (videoRef.current && videoRef.current.srcObject) {
+      const tracks = videoRef.current.srcObject.getTracks();
+      tracks.forEach(track => track.stop());
+      setIsCameraActive(false);
+    }
+  };
+
+  const takePhoto = () => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (video && canvas) {
+      const context = canvas.getContext('2d');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const data = canvas.toDataURL('image/jpeg', 0.8);
+      setFormData(prev => ({ ...prev, photo: data }));
+      stopCamera();
+    }
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!formData.name.trim()) return alert("Nama wajib diisi!");
+    if (!formData.photo) return alert("Foto bukti wajib diambil!");
+    if (!formData.location) return alert("Lokasi GPS wajib aktif!");
+
+    setLoading(true);
+    try {
+      const now = new Date();
+      await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'presensi'), {
+        ...formData,
+        timestamp: now.getTime(),
+        dateStr: now.toLocaleDateString('id-ID'),
+        timeStr: now.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' }),
+        userId: user.uid
+      });
+      
+      setFormData({ name: '', gen: '60', status: 'Hadir', photo: null, location: null });
+      setLocationStatus('idle');
+      alert("Presensi Berhasil Terkirim!");
+    } catch (err) {
+      alert("Gagal mengirim data.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleAdminLogin = (e) => {
+    e.preventDefault();
+    if (pinInput === '3992') setIsAdminAuthenticated(true);
+    else alert("PIN Salah!");
+  };
+
+  const handleReset = async () => {
+    if (!window.confirm("Hapus semua data presensi?")) return;
+    const q = collection(db, 'artifacts', appId, 'public', 'data', 'presensi');
+    const snapshot = await getDocs(q);
+    for (const d of snapshot.docs) {
+      await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'presensi', d.id));
+    }
+    alert("Database dibersihkan.");
+  };
+
+  return (
+    <div className="min-h-screen bg-[#f8fafc] text-slate-900" style={{ fontFamily: "'Plus Jakarta Sans', sans-serif" }}>
+      {/* Navbar */}
+      <nav className="bg-white border-b border-slate-200 sticky top-0 z-50">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+          <div className="flex justify-between h-20 items-center">
+            <div className="flex items-center gap-4">
+              <div className="w-14 h-14 bg-white rounded-xl overflow-hidden flex items-center justify-center border border-slate-100">
+                <img 
+                  src={LOGO_URL} 
+                  alt="PT Tirta Waluya" 
+                  className="w-full h-full object-contain p-1"
+                  onError={(e) => { e.target.src = "https://via.placeholder.com/100?text=LOGO"; }} 
+                />
+              </div>
+              <div>
+                <h1 className="text-xl font-bold text-slate-800 tracking-tight">PT Tirta Waluya</h1>
+                <p className="text-[10px] uppercase tracking-[0.2em] text-emerald-600 font-bold">Presensi Digital Staff</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-6">
+              <div className="hidden md:block text-right">
+                <p className="text-sm font-semibold text-slate-600">{currentTime.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</p>
+                <p className="text-xs text-slate-400">{currentTime.toLocaleDateString('id-ID', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}</p>
+              </div>
+              <div className="flex bg-slate-100 p-1 rounded-xl">
+                <button onClick={() => setView('staff')} className={`px-4 py-1.5 text-xs font-bold rounded-lg transition-all ${view === 'staff' ? 'bg-white text-emerald-600 shadow-sm' : 'text-slate-500'}`}>Staff</button>
+                <button onClick={() => setView('admin')} className={`px-4 py-1.5 text-xs font-bold rounded-lg transition-all ${view === 'admin' ? 'bg-white text-emerald-600 shadow-sm' : 'text-slate-500'}`}>Admin</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </nav>
+
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-10">
+        {view === 'staff' && (
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+            {/* SISI KIRI: INPUT FORM */}
+            <div className="lg:col-span-5">
+              <div className="bg-white rounded-3xl shadow-xl shadow-emerald-900/5 p-8 border border-slate-200">
+                <h2 className="text-lg font-bold mb-6 text-slate-800 flex items-center gap-2">
+                  <span className="w-1.5 h-6 bg-emerald-500 rounded-full"></span>
+                  Input Kehadiran
+                </h2>
+                
+                <form onSubmit={handleSubmit} className="space-y-6">
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Nama Lengkap</label>
+                    <input 
+                      type="text" 
+                      value={formData.name} 
+                      onChange={(e) => setFormData({...formData, name: e.target.value})} 
+                      placeholder="Masukkan nama staff..." 
+                      className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 focus:ring-4 focus:ring-emerald-500/10 focus:border-emerald-600 outline-none transition-all text-sm font-medium" 
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Angkatan</label>
+                    <select 
+                      value={formData.gen} 
+                      onChange={(e) => setFormData({...formData, gen: e.target.value})} 
+                      className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-3 focus:ring-4 focus:ring-emerald-500/10 outline-none text-sm font-bold text-slate-700"
+                    >
+                      <option value="60">Angkatan 60</option>
+                      <option value="61">Angkatan 61</option>
+                      <option value="62">Angkatan 62</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Status</label>
+                    <div className="grid grid-cols-2 gap-2">
+                      {['Hadir', 'Izin', 'Sakit', 'Alfa'].map(s => (
+                        <button 
+                          key={s} 
+                          type="button" 
+                          onClick={() => setFormData({...formData, status: s})} 
+                          className={`py-3 rounded-xl border text-sm font-bold transition-all ${formData.status === s ? 'bg-emerald-600 text-white border-emerald-600 shadow-md' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'}`}
+                        >
+                          {s}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Bukti Kehadiran (Foto)</label>
+                    <div className="relative aspect-video bg-slate-900 rounded-2xl overflow-hidden border-2 border-slate-100 group">
+                      {!formData.photo && !isCameraActive && (
+                        <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center cursor-pointer" onClick={startCamera}>
+                          <div className="w-12 h-12 bg-slate-800 rounded-full flex items-center justify-center mb-3 text-white/30 group-hover:text-emerald-400 transition-colors">
+                            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                          </div>
+                          <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Klik untuk Ambil Foto Selfie</span>
+                        </div>
+                      )}
+
+                      {isCameraActive && (
+                        <>
+                          <video ref={videoRef} autoPlay playsInline className="w-full h-full object-cover" style={{ transform: 'scaleX(-1)' }} />
+                          <button type="button" onClick={takePhoto} className="absolute bottom-6 left-1/2 -translate-x-1/2 w-12 h-12 bg-white rounded-full border-4 border-emerald-600/30 flex items-center justify-center shadow-xl active:scale-90 transition-all">
+                            <div className="w-6 h-6 bg-emerald-600 rounded-full"></div>
+                          </button>
+                        </>
+                      )}
+
+                      {formData.photo && (
+                        <div className="relative w-full h-full">
+                          <img src={formData.photo} alt="Result" className="w-full h-full object-cover" style={{ transform: 'scaleX(-1)' }} />
+                          <button type="button" onClick={() => { setFormData({...formData, photo: null}); startCamera(); }} className="absolute top-4 right-4 bg-white/90 p-2 rounded-lg shadow-lg hover:text-emerald-600">
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                    {locationStatus === 'found' && (
+                      <p className="mt-2 text-[10px] text-sky-600 font-bold uppercase tracking-wider flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 bg-sky-600 rounded-full animate-pulse"></span> GPS Aktif: {formData.location.lat.toFixed(4)}, {formData.location.lng.toFixed(4)}
+                      </p>
+                    )}
+                  </div>
+
+                  <button 
+                    disabled={loading || !formData.photo || !formData.location} 
+                    className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-4 rounded-2xl shadow-lg shadow-emerald-200 transition-all active:scale-[0.98] disabled:bg-slate-200 disabled:shadow-none"
+                  >
+                    {loading ? 'MENYIMPAN DATA...' : 'Simpan Presensi'}
+                  </button>
+                </form>
+              </div>
+            </div>
+
+            {/* SISI KANAN: TABEL */}
+            <div className="lg:col-span-7">
+              <div className="bg-white rounded-3xl shadow-sm border border-slate-200 overflow-hidden">
+                <div className="px-8 py-6 border-b border-slate-100 flex justify-between items-center">
+                  <h3 className="font-bold text-slate-800">Daftar Kehadiran Hari Ini</h3>
+                  <span className="bg-emerald-50 text-emerald-700 text-[10px] font-bold px-3 py-1 rounded-full uppercase tracking-widest">
+                    {attendanceList.filter(d => d.dateStr === new Date().toLocaleDateString('id-ID')).length} Staff
+                  </span>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left">
+                    <thead className="bg-slate-50 text-[10px] uppercase font-bold text-slate-400 tracking-widest">
+                      <tr>
+                        <th className="px-8 py-4">Foto</th>
+                        <th className="px-8 py-4">Nama</th>
+                        <th className="px-8 py-4">Status</th>
+                        <th className="px-8 py-4 text-right">Waktu</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-50">
+                      {attendanceList.filter(d => d.dateStr === new Date().toLocaleDateString('id-ID')).map(item => (
+                        <tr key={item.id} className="hover:bg-slate-50 transition-all group">
+                          <td className="px-8 py-4">
+                            <img src={item.photo} className="w-10 h-10 rounded-full object-cover border-2 border-white shadow-sm group-hover:scale-110 transition-transform" style={{ transform: 'scaleX(-1)' }} alt="Bukti" />
+                          </td>
+                          <td className="px-8 py-4">
+                            <p className="font-bold text-slate-700 text-sm">{item.name}</p>
+                            <p className="text-[10px] text-slate-400 font-bold uppercase">Gen {item.gen}</p>
+                          </td>
+                          <td className="px-8 py-4">
+                            <span className={`px-2 py-1 rounded text-[9px] font-black uppercase ${item.status === 'Hadir' ? 'bg-sky-100 text-sky-700' : 'bg-red-100 text-red-700'}`}>{item.status}</span>
+                          </td>
+                          <td className="px-8 py-4 text-right">
+                            <p className="text-[10px] text-slate-400 font-bold italic">{item.timeStr}</p>
+                          </td>
+                        </tr>
+                      ))}
+                      {attendanceList.filter(d => d.dateStr === new Date().toLocaleDateString('id-ID')).length === 0 && (
+                        <tr><td colSpan="4" className="px-8 py-10 text-center text-xs text-slate-400 italic">Belum ada data hari ini.</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {view === 'admin' && (
+          <div className="max-w-4xl mx-auto space-y-8">
+            {!isAdminAuthenticated ? (
+              <div className="max-w-md mx-auto bg-white rounded-3xl shadow-xl p-10 border border-slate-200 text-center">
+                <h3 className="font-bold text-xl mb-6 text-slate-800">Otoritas Pimpinan</h3>
+                <form onSubmit={handleAdminLogin} className="space-y-4">
+                  <input 
+                    type="password" 
+                    placeholder="PIN" 
+                    className="w-full bg-slate-50 border border-slate-200 rounded-xl px-4 py-4 text-center text-2xl font-bold tracking-[0.5em] outline-none focus:border-emerald-600 transition-all" 
+                    value={pinInput} 
+                    onChange={(e) => setPinInput(e.target.value)} 
+                  />
+                  <button className="w-full bg-emerald-600 text-white font-bold py-4 rounded-xl hover:bg-emerald-700 transition-all">KONFIRMASI</button>
+                </form>
+              </div>
+            ) : (
+              <>
+                <div className="bg-white rounded-3xl shadow-sm border border-slate-200 overflow-hidden">
+                  <div className="px-8 py-6 border-b border-slate-100 flex justify-between items-center">
+                    <h3 className="font-bold text-slate-800">Rekapitulasi Akumulasi Staff</h3>
+                    <button onClick={handleReset} className="text-red-400 hover:text-red-600 text-[10px] font-bold uppercase tracking-widest">Reset Database</button>
+                  </div>
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-left">
+                      <thead className="bg-slate-50 text-[10px] uppercase font-bold text-slate-400 tracking-widest">
+                        <tr>
+                          <th className="px-8 py-4">Nama & Foto</th>
+                          <th className="px-8 py-4 text-center">Status</th>
+                          <th className="px-8 py-4 text-center">Lokasi</th>
+                          <th className="px-8 py-4 text-right">Tanggal Lapor</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-50">
+                        {attendanceList.map(item => (
+                          <tr key={item.id} className="hover:bg-slate-50">
+                            <td className="px-8 py-4 flex items-center gap-4">
+                              <img src={item.photo} className="w-10 h-10 rounded-lg object-cover" style={{ transform: 'scaleX(-1)' }} alt="Bukti" />
+                              <div>
+                                <p className="font-bold text-slate-700 text-sm">{item.name}</p>
+                                <p className="text-[10px] text-slate-400">Angkatan {item.gen}</p>
+                              </div>
+                            </td>
+                            <td className="px-8 py-4 text-center">
+                              <span className="px-3 py-1 rounded-full text-[9px] font-bold uppercase bg-slate-100">{item.status}</span>
+                            </td>
+                            <td className="px-8 py-4 text-center">
+                              {item.location && (
+                                <a href={`https://www.google.com/maps?q=${item.location.lat},${item.location.lng}`} target="_blank" rel="noreferrer" className="text-sky-600 hover:underline text-xs font-bold">🗺️ Map</a>
+                              )}
+                            </td>
+                            <td className="px-8 py-4 text-right">
+                              <p className="text-xs font-bold text-slate-700">{item.dateStr}</p>
+                              <p className="text-[10px] text-slate-400">{item.timeStr}</p>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {/* Tanda Tangan Pimpinan (Hanya di Admin View) */}
+                <div className="mt-12 flex justify-end">
+                  <div className="text-center">
+                    <p className="text-sm text-slate-500 mb-1">Sukabumi, <span className="font-bold text-slate-800">{new Date().toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' })}</span></p>
+                    <p className="text-sm font-bold text-slate-800 uppercase tracking-tighter">Kepala Perusahaan PT Tirta Waluya</p>
+                    <div className="mt-16 w-64 border-b-2 border-slate-800 mx-auto"></div>
+                    <p className="mt-2 text-xs text-slate-400 italic font-medium">Validasi Digital Authorized</p>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+      </main>
+      <canvas ref={canvasRef} className="hidden" />
+    </div>
+  );
+}
